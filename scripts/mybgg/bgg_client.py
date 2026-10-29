@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import time
 from xml.etree.ElementTree import fromstring
@@ -10,7 +11,7 @@ from .http_client import CachedHttpClient, HttpSession
 logger = logging.getLogger(__name__)
 
 class BGGClient:
-    BASE_URL = "https://www.boardgamegeek.com/xmlapi2"
+    BASE_URL = "https://boardgamegeek.com/xmlapi2"
 
     def __init__(self, cache=None, debug=False):
         if not cache:
@@ -18,13 +19,15 @@ class BGGClient:
         else:
             self.requester = cache.cache
 
+        self.api_token = os.environ.get("BGG_API_TOKEN", "").strip()
+
         if debug:
             logging.basicConfig(level=logging.DEBUG)
 
     def collection(self, user_name, **kwargs):
-        params = kwargs.copy()
+        params = {"own": 1, "stats": 1, **kwargs}
         params["username"] = user_name
-        data = self._make_request("/collection?version=1", params)
+        data = self._make_request("/collection", params)
         collection = self._collection_to_games(data)
         return collection
 
@@ -95,7 +98,8 @@ class BGGClient:
             time.sleep(sleep_time)
 
         try:
-            response = self.requester.get(BGGClient.BASE_URL + url, params=params)
+            headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
+            response = self.requester.get(BGGClient.BASE_URL + url, params=params, headers=headers)
             response.raise_for_status()  # This will raise an exception for 4xx and 5xx status codes
         except Exception as e:
             # Handle both requests exceptions and our simple cache exceptions
@@ -109,6 +113,19 @@ class BGGClient:
                     return self._make_request(url, params=params, tries=tries + 1)
                 else:
                     raise BGGException("BGG returned Too Many Requests")
+            # Non-retryable errors: fail fast instead of retrying for ~16 minutes.
+            # BGG returns 401 with "WWW-Authenticate: Bearer realm=\"xml api\"" to
+            # requests coming from datacenter IPs (e.g. GitHub Actions / cloud runners).
+            # 403/404 are also permanent for a given request. Retrying cannot help.
+            elif any(f" {code}" in error_message or f"HTTP {code}" in error_message for code in ("401", "403", "404")):
+                raise BGGException(
+                    f"BGG rejected the request with a non-retryable error while requesting "
+                    f"{BGGClient.BASE_URL + url}: {error_message}. "
+                    "A 401 means API authorization is missing or invalid. Register an application "
+                    "at https://boardgamegeek.com/applications and set BGG_API_TOKEN to its token. "
+                    "A 404 means the user or collection "
+                    "was not found; check bgg_username in config.ini."
+                )
             else:
                 # Other HTTP errors or connection errors
                 if tries < 10:
